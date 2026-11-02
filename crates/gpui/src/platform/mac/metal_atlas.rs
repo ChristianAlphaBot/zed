@@ -57,6 +57,27 @@ impl PlatformAtlas for MetalAtlas {
         }
     }
 
+    fn usage(&self) -> crate::AtlasUsage {
+        let lock = self.0.lock();
+        let mut usage = crate::AtlasUsage {
+            tiles: lock.tiles_by_key.len(),
+            ..Default::default()
+        };
+        for texture in lock
+            .monochrome_textures
+            .textures
+            .iter()
+            .chain(lock.polychrome_textures.textures.iter())
+            .flatten()
+        {
+            usage.textures += 1;
+            usage.bytes += texture.metal_texture.width()
+                * texture.metal_texture.height()
+                * u64::from(texture.bytes_per_pixel());
+        }
+        usage
+    }
+
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
         let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {

@@ -823,6 +823,19 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+/// What a window's sprite atlas holds: how many textures, their bytes on the GPU, and how many
+/// tiles (glyph rasters, paths and images, each at its own size) are kept in them. Counts only:
+/// nothing of what a tile shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlasUsage {
+    /// Textures allocated, monochrome and polychrome together.
+    pub textures: usize,
+    /// Their bytes: each texture's width times its height times its bytes per pixel.
+    pub bytes: u64,
+    /// Tiles kept, by key.
+    pub tiles: usize,
+}
+
 pub(crate) trait PlatformAtlas: Send + Sync {
     fn get_or_insert_with<'a>(
         &self,
@@ -830,6 +843,10 @@ pub(crate) trait PlatformAtlas: Send + Sync {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+    /// What the atlas holds now ([`AtlasUsage`]); an atlas that does not count reads empty.
+    fn usage(&self) -> AtlasUsage {
+        AtlasUsage::default()
+    }
 }
 
 struct AtlasTextureList<T> {
