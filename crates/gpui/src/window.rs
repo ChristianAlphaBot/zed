@@ -1787,6 +1787,12 @@ impl Window {
         self.appearance
     }
 
+    /// What this window's sprite atlas holds: its textures, their bytes and its tiles
+    /// ([`crate::AtlasUsage`]). Counts only, for a memory read.
+    pub fn sprite_atlas_usage(&self) -> crate::AtlasUsage {
+        self.sprite_atlas.usage()
+    }
+
     /// Returns the size of the drawable area within the window.
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
