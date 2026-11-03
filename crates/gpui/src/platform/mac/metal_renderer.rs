@@ -54,15 +54,47 @@ pub unsafe fn new_renderer(
 pub(crate) struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
+    /// How many frames in a row, since the size last changed, used under a quarter of it.
+    small_frames: u32,
 }
+
+/// The size the pool starts at, and the least it shrinks back to.
+const INSTANCE_BUFFER_DEFAULT_SIZE: usize = 2 * 1024 * 1024;
+/// How many frames in a row must fit in a quarter of the size before it halves. At 60 to 120
+/// frames a second that is one to two seconds of drawing.
+const INSTANCE_BUFFER_SHRINK_AFTER_FRAMES: u32 = 120;
 
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INSTANCE_BUFFER_DEFAULT_SIZE,
             buffers: Vec::new(),
+            small_frames: 0,
         }
     }
+}
+
+/// PURE: the size the pool should take after a frame that fit and used `used` bytes of
+/// `buffer_size`, given `small_frames` frames before it that each used under a quarter. A frame
+/// that does not fit doubles the size (in `MetalRenderer::draw`), and nothing else ever brought
+/// it back down, so one large frame kept every window's buffers at that size for the rest of
+/// the run. This halves it, one step at a time down to the default, once
+/// `INSTANCE_BUFFER_SHRINK_AFTER_FRAMES` frames in a row used under a quarter. After a halving
+/// those frames use under half the new size, so the next frame like them still fits.
+/// Returns the new count of small frames, and the new size when it shrinks.
+fn instance_buffer_shrink(
+    buffer_size: usize,
+    used: usize,
+    small_frames: u32,
+) -> (u32, Option<usize>) {
+    if buffer_size <= INSTANCE_BUFFER_DEFAULT_SIZE || used >= buffer_size / 4 {
+        return (0, None);
+    }
+    let small_frames = small_frames + 1;
+    if small_frames < INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+        return (small_frames, None);
+    }
+    (0, Some((buffer_size / 2).max(INSTANCE_BUFFER_DEFAULT_SIZE)))
 }
 
 pub(crate) struct InstanceBuffer {
@@ -74,6 +106,20 @@ impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
         self.buffers.clear();
+        self.small_frames = 0;
+    }
+
+    /// A frame fit and used `used` bytes: halve the size once frames have fit in a quarter of it
+    /// for a while ([`instance_buffer_shrink`]). Buffers still in flight at the old size are
+    /// dropped when they come back ([`Self::release`]).
+    pub(crate) fn note_fit(&mut self, used: usize) {
+        let (small_frames, shrink) =
+            instance_buffer_shrink(self.buffer_size, used, self.small_frames);
+        self.small_frames = small_frames;
+        if let Some(buffer_size) = shrink {
+            self.reset(buffer_size);
+            log::info!("decreased instance buffer size to {}", buffer_size);
+        }
     }
 
     pub(crate) fn acquire(&mut self, device: &metal::Device) -> InstanceBuffer {
@@ -384,7 +430,8 @@ impl MetalRenderer {
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
 
             match command_buffer {
-                Ok(command_buffer) => {
+                Ok((command_buffer, used)) => {
+                    self.instance_buffer_pool.lock().note_fit(used);
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -432,7 +479,7 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
+    ) -> Result<(metal::CommandBuffer, usize)> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
@@ -554,7 +601,7 @@ impl MetalRenderer {
             location: 0,
             length: instance_offset as NSUInteger,
         });
-        Ok(command_buffer.to_owned())
+        Ok((command_buffer.to_owned(), instance_offset))
     }
 
     fn draw_paths_to_intermediate(
@@ -1362,4 +1409,39 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MB: usize = 1024 * 1024;
+
+    #[test]
+    fn the_instance_buffer_halves_back_only_after_a_run_of_small_frames() {
+        // At the default it never shrinks, however small the frames.
+        assert_eq!(
+            instance_buffer_shrink(INSTANCE_BUFFER_DEFAULT_SIZE, 0, 500),
+            (0, None)
+        );
+        // Grown to 64 MB: frames under a quarter count, and the 120th in a row halves it.
+        let mut small = 0;
+        for _ in 1..INSTANCE_BUFFER_SHRINK_AFTER_FRAMES {
+            let (next, shrink) = instance_buffer_shrink(64 * MB, 16 * MB - 1, small);
+            assert_eq!(shrink, None);
+            small = next;
+        }
+        assert_eq!(small, INSTANCE_BUFFER_SHRINK_AFTER_FRAMES - 1);
+        assert_eq!(
+            instance_buffer_shrink(64 * MB, MB, small),
+            (0, Some(32 * MB))
+        );
+        // One frame at a quarter or more starts the count again.
+        assert_eq!(instance_buffer_shrink(64 * MB, 16 * MB, small), (0, None));
+        // It halves one step at a time, and never below the default.
+        assert_eq!(
+            instance_buffer_shrink(3 * MB, 0, INSTANCE_BUFFER_SHRINK_AFTER_FRAMES - 1),
+            (0, Some(INSTANCE_BUFFER_DEFAULT_SIZE))
+        );
+    }
 }
