@@ -99,6 +99,12 @@ impl Arena {
         self.chunks.len() * self.chunk_size.get()
     }
 
+    /// cipher patch: the bytes this arena has reserved: its chunks, which it keeps from the largest
+    /// frame drawn, and its list of elements at its capacity. Sizes only.
+    pub fn reserved_bytes(&self) -> usize {
+        self.capacity() + self.elements.capacity() * std::mem::size_of::<ArenaElement>()
+    }
+
     pub fn clear(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));

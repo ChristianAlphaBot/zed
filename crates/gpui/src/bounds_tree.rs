@@ -103,6 +103,13 @@ where
         + Half
         + Default,
 {
+    /// cipher patch: the bytes the tree's lists hold at their capacity. Sizes only.
+    pub fn heap_bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<Node<U>>()
+            + (self.insert_path.capacity() + self.search_stack.capacity())
+                * std::mem::size_of::<usize>()
+    }
+
     /// Clears all nodes from the tree.
     pub fn clear(&mut self) {
         self.nodes.clear();

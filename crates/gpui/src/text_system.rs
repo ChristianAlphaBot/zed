@@ -337,6 +337,11 @@ pub struct WindowTextSystem {
 }
 
 impl WindowTextSystem {
+    /// cipher patch: the bytes this window's line layouts hold ([`LineLayoutCache::heap_bytes`]).
+    pub(crate) fn layout_heap_bytes(&self) -> usize {
+        self.line_layout_cache.heap_bytes()
+    }
+
     pub(crate) fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
             line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),

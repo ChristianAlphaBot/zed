@@ -35,6 +35,39 @@ pub(crate) struct Scene {
 }
 
 impl Scene {
+    /// cipher patch: the bytes this scene's lists hold at their capacity, which each keeps from the
+    /// largest frame drawn into it, and the vertices of the paths it holds now (each path is held
+    /// twice: in `paths` and as its paint operation). Sizes only, for a memory read.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        fn room<T>(list: &Vec<T>) -> usize {
+            list.capacity() * std::mem::size_of::<T>()
+        }
+        let painted_vertices = self
+            .paint_operations
+            .iter()
+            .map(|operation| match operation {
+                PaintOperation::Primitive(Primitive::Path(path)) => room(&path.vertices),
+                _ => 0,
+            })
+            .sum::<usize>();
+        room(&self.paint_operations)
+            + painted_vertices
+            + self.primitive_bounds.heap_bytes()
+            + room(&self.layer_stack)
+            + room(&self.shadows)
+            + room(&self.quads)
+            + room(&self.paths)
+            + self
+                .paths
+                .iter()
+                .map(|path| room(&path.vertices))
+                .sum::<usize>()
+            + room(&self.underlines)
+            + room(&self.monochrome_sprites)
+            + room(&self.polychrome_sprites)
+            + room(&self.surfaces)
+    }
+
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();

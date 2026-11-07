@@ -403,6 +403,63 @@ struct FrameCache {
     used_wrapped_lines: Vec<Arc<CacheKey>>,
 }
 
+/// cipher patch: an `Arc`'s own two counts, before its value.
+const ARC_COUNTS: usize = 2 * std::mem::size_of::<usize>();
+
+impl FrameCache {
+    /// cipher patch: what [`LineLayoutCache::heap_bytes`] counts for one frame. `seen` holds the
+    /// keys and layouts already counted.
+    fn heap_bytes(&self, seen: &mut collections::FxHashSet<usize>) -> usize {
+        use std::mem::size_of;
+        let key = size_of::<Arc<CacheKey>>();
+        let mut bytes = self.lines.capacity() * (key + size_of::<Arc<LineLayout>>() + 1)
+            + self.wrapped_lines.capacity() * (key + size_of::<Arc<WrappedLineLayout>>() + 1)
+            + (self.used_lines.capacity() + self.used_wrapped_lines.capacity()) * key;
+        for (key, layout) in &self.lines {
+            bytes += key_bytes(key, seen) + layout_bytes(layout, seen);
+        }
+        for (key, wrapped) in &self.wrapped_lines {
+            bytes += key_bytes(key, seen);
+            if seen.insert(Arc::as_ptr(wrapped) as usize) {
+                bytes += ARC_COUNTS + size_of::<WrappedLineLayout>();
+                if wrapped.wrap_boundaries.spilled() {
+                    bytes += wrapped.wrap_boundaries.capacity() * size_of::<WrapBoundary>();
+                }
+                bytes += layout_bytes(&wrapped.unwrapped_layout, seen);
+            }
+        }
+        bytes
+    }
+}
+
+/// cipher patch: a cache key's own bytes, once: the key, its text and its spilled runs.
+fn key_bytes(key: &Arc<CacheKey>, seen: &mut collections::FxHashSet<usize>) -> usize {
+    if !seen.insert(Arc::as_ptr(key) as usize) {
+        return 0;
+    }
+    let runs = if key.runs.spilled() {
+        key.runs.capacity() * std::mem::size_of::<FontRun>()
+    } else {
+        0
+    };
+    ARC_COUNTS + std::mem::size_of::<CacheKey>() + key.text.len() + runs
+}
+
+/// cipher patch: a layout's own bytes, once: the layout, its runs and their glyphs.
+fn layout_bytes(layout: &Arc<LineLayout>, seen: &mut collections::FxHashSet<usize>) -> usize {
+    if !seen.insert(Arc::as_ptr(layout) as usize) {
+        return 0;
+    }
+    ARC_COUNTS
+        + std::mem::size_of::<LineLayout>()
+        + layout.runs.capacity() * std::mem::size_of::<ShapedRun>()
+        + layout
+            .runs
+            .iter()
+            .map(|run| run.glyphs.capacity() * std::mem::size_of::<ShapedGlyph>())
+            .sum::<usize>()
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
     lines_index: usize,
@@ -410,6 +467,15 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutCache {
+    /// cipher patch: the bytes the previous and current frames' layouts hold: each map and list at
+    /// its capacity, each key's text and runs, and each layout's runs and glyphs. A key or layout
+    /// both frames hold is counted once. Sizes only, for a memory read.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut seen = collections::FxHashSet::default();
+        let previous = self.previous_frame.lock().heap_bytes(&mut seen);
+        previous + self.current_frame.read().heap_bytes(&mut seen)
+    }
+
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         Self {
             previous_frame: Mutex::default(),

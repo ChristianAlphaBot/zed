@@ -220,6 +220,24 @@ thread_local! {
     pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
 }
 
+/// cipher patch: what a window's frame stores hold, in bytes, each at the capacity it keeps from
+/// the largest frame drawn ([`Window::frame_usage`]). Sizes only: nothing of what a frame shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameUsage {
+    /// The two frames' scenes: their primitive lists, paint operations and bounds trees, and the
+    /// vertices of the paths they hold.
+    pub scenes: usize,
+    /// The line layouts the window keeps for its previous and current frames.
+    pub layouts: usize,
+}
+
+/// cipher patch: the bytes the calling thread's element arena has reserved, which every window
+/// drawn on this thread shares (its chunks, kept from the largest frame drawn, and its element
+/// list). `None` while a draw holds the arena.
+pub fn element_arena_bytes() -> Option<usize> {
+    ELEMENT_ARENA.with(|arena| arena.try_borrow().ok().map(|arena| arena.reserved_bytes()))
+}
+
 /// Returned when the element arena has been used and so must be cleared before the next draw.
 #[must_use]
 pub struct ArenaClearNeeded;
@@ -1791,6 +1809,16 @@ impl Window {
     /// ([`crate::AtlasUsage`]). Counts only, for a memory read.
     pub fn sprite_atlas_usage(&self) -> crate::AtlasUsage {
         self.sprite_atlas.usage()
+    }
+
+    /// cipher patch: what this window's frame stores hold, in bytes ([`FrameUsage`]): both frames'
+    /// scenes and the window's line layouts, each at the capacity it keeps from the largest frame
+    /// drawn. Sizes only, for a memory read.
+    pub fn frame_usage(&self) -> FrameUsage {
+        FrameUsage {
+            scenes: self.rendered_frame.scene.heap_bytes() + self.next_frame.scene.heap_bytes(),
+            layouts: self.text_system.layout_heap_bytes(),
+        }
     }
 
     /// Returns the size of the drawable area within the window.
@@ -5273,5 +5301,43 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+// cipher patch: what a window's frame stores hold grows with what its frames draw.
+#[cfg(test)]
+mod frame_usage_tests {
+    use crate::{
+        Context, IntoElement, ParentElement, Render, Styled, TestAppContext, Window, div, px, red,
+    };
+
+    struct Rows(usize);
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children(
+                (0..self.0).map(|row| div().h(px(4.)).bg(red()).child(format!("row {row}"))),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_window_counts_what_its_frames_hold(cx: &mut TestAppContext) {
+        let (rows, cx) = cx.add_window_view(|_, _| Rows(2));
+        cx.run_until_parked();
+        let few = cx.update(|window, _| window.frame_usage());
+        assert!(few.scenes > 0 && few.layouts > 0, "{few:?}");
+
+        rows.update(cx, |rows, cx| {
+            rows.0 = 150;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let many = cx.update(|window, _| window.frame_usage());
+        assert!(
+            many.scenes > few.scenes && many.layouts > few.layouts,
+            "{few:?} then {many:?}"
+        );
+        assert!(super::element_arena_bytes().is_some_and(|bytes| bytes > 0));
     }
 }
