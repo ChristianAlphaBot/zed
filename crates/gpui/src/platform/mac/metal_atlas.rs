@@ -3,7 +3,7 @@ use crate::{
     DevicePixels, PlatformAtlas, Point, Scene, Size, platform::AtlasTextureList,
 };
 use anyhow::{Context as _, Result};
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use metal::Device;
@@ -123,52 +123,81 @@ impl PlatformAtlas for MetalAtlas {
         if freed.is_empty() {
             return;
         }
-        let mut emptied = false;
         for tile in &freed {
-            emptied |= state.release(tile);
+            state.release(tile);
         }
-        if emptied {
-            // A texture let go takes with it any key still pointing into it: an image `remove`
-            // left after counting it out.
-            let (monochrome, polychrome) = (&state.monochrome_textures, &state.polychrome_textures);
-            state.tiles_by_key.retain(|_, entry| {
-                let id = entry.tile.texture_id;
-                let textures = match id.kind {
-                    AtlasTextureKind::Monochrome => monochrome,
-                    AtlasTextureKind::Polychrome => polychrome,
-                };
-                textures
-                    .textures
-                    .get(id.index as usize)
-                    .is_some_and(Option::is_some)
-            });
+        // A texture is let go only once no key points into it, never on its count alone: upstream's
+        // `remove` counts an image out but keeps its key while the texture is still counted, so a
+        // count can read zero while that image, in the frame about to be presented, is still drawn
+        // from the texture. A count above zero always has a key behind it, so only a texture
+        // counted down to zero is looked at.
+        let mut emptied: Vec<AtlasTextureId> = Vec::new();
+        for tile in &freed {
+            let id = tile.texture_id;
+            let counted_out = state
+                .textures(id.kind)
+                .textures
+                .get(id.index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|texture| texture.live_atlas_keys == 0);
+            if counted_out && !emptied.contains(&id) {
+                emptied.push(id);
+            }
+        }
+        if emptied.is_empty() {
+            return;
+        }
+        let held: FxHashSet<AtlasTextureId> = state
+            .tiles_by_key
+            .values()
+            .map(|entry| entry.tile.texture_id)
+            .collect();
+        for id in emptied {
+            if held.contains(&id) {
+                continue;
+            }
+            let textures = state.textures_mut(id.kind);
+            if let Some(slot) = textures.textures.get_mut(id.index as usize) {
+                if slot.take().is_some() {
+                    textures.free_list.push(id.index as usize);
+                }
+            }
         }
     }
 }
 
 impl MetalAtlasState {
-    /// cipher patch: `tile`'s place in its texture given back, and the texture let go once none of
-    /// its places is held; true when it was.
-    fn release(&mut self, tile: &AtlasTile) -> bool {
+    /// cipher patch: `tile`'s place in its texture given back, and the texture counted down. The
+    /// sweep lets the texture itself go, once no key points into it.
+    fn release(&mut self, tile: &AtlasTile) {
         let id = tile.texture_id;
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-        };
-        let Some(slot) = textures.textures.get_mut(id.index as usize) else {
-            return false;
-        };
-        let Some(texture) = slot.as_mut() else {
-            return false;
+        let Some(Some(texture)) = self
+            .textures_mut(id.kind)
+            .textures
+            .get_mut(id.index as usize)
+        else {
+            return;
         };
         texture.allocator.deallocate(tile.tile_id.into());
-        texture.decrement_ref_count();
-        if !texture.is_unreferenced() {
-            return false;
+        // Upstream's `remove` may already have counted an image out of this texture: never below
+        // zero.
+        texture.live_atlas_keys = texture.live_atlas_keys.saturating_sub(1);
+    }
+
+    /// cipher patch: the textures of one kind.
+    fn textures(&self, kind: AtlasTextureKind) -> &AtlasTextureList<MetalAtlasTexture> {
+        match kind {
+            AtlasTextureKind::Monochrome => &self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &self.polychrome_textures,
         }
-        *slot = None;
-        textures.free_list.push(id.index as usize);
-        true
+    }
+
+    /// cipher patch: the textures of one kind, to change.
+    fn textures_mut(&mut self, kind: AtlasTextureKind) -> &mut AtlasTextureList<MetalAtlasTexture> {
+        match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+        }
     }
 
     fn allocate(
@@ -360,3 +389,70 @@ impl From<etagere::Rectangle> for Bounds<DevicePixels> {
 struct AssertSend<T>(T);
 
 unsafe impl<T> Send for AssertSend<T> {}
+
+// cipher patch: the sweep lets a texture go only once no key points into it.
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use crate::{
+        FontId, GlyphId, ImageId, PolychromeSprite, RenderGlyphParams, RenderImageParams, px, size,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn a_texture_an_image_is_still_drawn_from_stays_when_its_count_runs_out() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let atlas = MetalAtlas::new(device);
+        atlas.0.lock().sweep = AtlasSweep::new(Duration::ZERO);
+        let image = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let emoji = AtlasKey::Glyph(RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id: GlyphId(1),
+            font_size: px(13.),
+            subpixel_variant: Point::default(),
+            scale_factor: 2.,
+            is_emoji: true,
+        });
+        let insert = |key: &AtlasKey| {
+            let bytes = vec![0_u8; 4 * 4 * 4];
+            atlas
+                .get_or_insert_with(key, &mut || {
+                    Ok(Some((
+                        size(DevicePixels(4), DevicePixels(4)),
+                        Cow::Owned(bytes.clone()),
+                    )))
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let drawn = insert(&image);
+        assert_eq!(drawn.texture_id, insert(&emoji).texture_id, "one texture");
+        // Upstream's `remove` counts the image out and keeps its key: the emoji still counts.
+        atlas.remove(&image);
+        let mut frame = Scene::default();
+        frame.polychrome_sprites.push(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false,
+            opacity: 1.,
+            bounds: Default::default(),
+            content_mask: Default::default(),
+            corner_radii: Default::default(),
+            tile: drawn.clone(),
+        });
+        // The clock starts, then two sweeps without a paint of the emoji let it go, and the
+        // texture's count reaches zero while the frame still draws the image from it.
+        for _ in 0..3 {
+            atlas.sweep(&frame);
+        }
+        assert!(!atlas.0.lock().tiles_by_key.contains_key(&emoji));
+        assert!(atlas.0.lock().tiles_by_key.contains_key(&image));
+        // What the frame's present reads: a texture let go here was an unwrap of nothing.
+        assert_eq!(atlas.metal_texture(drawn.texture_id).width(), 1024);
+    }
+}
