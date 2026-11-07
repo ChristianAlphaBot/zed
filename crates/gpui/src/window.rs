@@ -2035,6 +2035,10 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        // cipher patch: let go of the glyphs and SVGs no frame draws any more. The frame just
+        // drawn is the only one a later frame copies primitives from (`reuse_paint`), so the
+        // atlas keeps every tile it holds ([`crate::AtlasSweep`]).
+        self.sprite_atlas.sweep(&self.rendered_frame.scene);
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 

@@ -1,6 +1,6 @@
 use crate::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
-    Point, Size, platform::AtlasTextureList,
+    AtlasEntry, AtlasKey, AtlasSweep, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds,
+    DevicePixels, PlatformAtlas, Point, Scene, Size, platform::AtlasTextureList,
 };
 use anyhow::{Context as _, Result};
 use collections::FxHashMap;
@@ -19,6 +19,7 @@ impl MetalAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             tiles_by_key: Default::default(),
+            sweep: AtlasSweep::new(AtlasSweep::EVERY),
         }))
     }
 
@@ -31,7 +32,9 @@ struct MetalAtlasState {
     device: AssertSend<Device>,
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
-    tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    tiles_by_key: FxHashMap<AtlasKey, AtlasEntry>,
+    /// cipher patch: when it lets go of the glyphs and SVGs no frame draws any more.
+    sweep: AtlasSweep,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -41,20 +44,22 @@ impl PlatformAtlas for MetalAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
         let mut lock = self.0.lock();
-        if let Some(tile) = lock.tiles_by_key.get(key) {
-            Ok(Some(tile.clone()))
-        } else {
-            let Some((size, bytes)) = build()? else {
-                return Ok(None);
-            };
-            let tile = lock
-                .allocate(size, key.texture_kind())
-                .context("failed to allocate")?;
-            let texture = lock.texture(tile.texture_id);
-            texture.upload(tile.bounds, &bytes);
-            lock.tiles_by_key.insert(key.clone(), tile.clone());
-            Ok(Some(tile))
+        let state = &mut *lock;
+        if let Some(entry) = state.tiles_by_key.get_mut(key) {
+            state.sweep.touch(entry);
+            return Ok(Some(entry.tile.clone()));
         }
+        let Some((size, bytes)) = build()? else {
+            return Ok(None);
+        };
+        let tile = state
+            .allocate(size, key.texture_kind())
+            .context("failed to allocate")?;
+        let texture = state.texture(tile.texture_id);
+        texture.upload(tile.bounds, &bytes);
+        let entry = state.sweep.entry(tile.clone());
+        state.tiles_by_key.insert(key.clone(), entry);
+        Ok(Some(tile))
     }
 
     fn usage(&self) -> crate::AtlasUsage {
@@ -80,7 +85,7 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
+        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.tile.texture_id) else {
             return;
         };
 
@@ -108,9 +113,64 @@ impl PlatformAtlas for MetalAtlas {
             }
         }
     }
+
+    fn sweep(&self, scene: &Scene) {
+        let mut lock = self.0.lock();
+        let state = &mut *lock;
+        let freed = state
+            .sweep
+            .sweep(std::time::Instant::now(), &mut state.tiles_by_key, scene);
+        if freed.is_empty() {
+            return;
+        }
+        let mut emptied = false;
+        for tile in &freed {
+            emptied |= state.release(tile);
+        }
+        if emptied {
+            // A texture let go takes with it any key still pointing into it: an image `remove`
+            // left after counting it out.
+            let (monochrome, polychrome) = (&state.monochrome_textures, &state.polychrome_textures);
+            state.tiles_by_key.retain(|_, entry| {
+                let id = entry.tile.texture_id;
+                let textures = match id.kind {
+                    AtlasTextureKind::Monochrome => monochrome,
+                    AtlasTextureKind::Polychrome => polychrome,
+                };
+                textures
+                    .textures
+                    .get(id.index as usize)
+                    .is_some_and(Option::is_some)
+            });
+        }
+    }
 }
 
 impl MetalAtlasState {
+    /// cipher patch: `tile`'s place in its texture given back, and the texture let go once none of
+    /// its places is held; true when it was.
+    fn release(&mut self, tile: &AtlasTile) -> bool {
+        let id = tile.texture_id;
+        let textures = match id.kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+        };
+        let Some(slot) = textures.textures.get_mut(id.index as usize) else {
+            return false;
+        };
+        let Some(texture) = slot.as_mut() else {
+            return false;
+        };
+        texture.allocator.deallocate(tile.tile_id.into());
+        texture.decrement_ref_count();
+        if !texture.is_unreferenced() {
+            return false;
+        }
+        *slot = None;
+        textures.free_list.push(id.index as usize);
+        true
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,

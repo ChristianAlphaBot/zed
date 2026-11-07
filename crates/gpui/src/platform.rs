@@ -847,6 +847,130 @@ pub(crate) trait PlatformAtlas: Send + Sync {
     fn usage(&self) -> AtlasUsage {
         AtlasUsage::default()
     }
+    /// cipher patch: let go of the glyphs and SVGs no frame draws any more ([`AtlasSweep`]),
+    /// `scene` being the frame just drawn. An atlas that keeps every tile does nothing.
+    fn sweep(&self, _scene: &Scene) {}
+}
+
+/// cipher patch: a tile an atlas keeps for its key, and the last sweep that saw it in use
+/// ([`AtlasSweep`]).
+#[cfg_attr(
+    not(any(target_os = "macos", test, feature = "test-support")),
+    allow(dead_code)
+)]
+#[derive(Clone, Debug)]
+pub(crate) struct AtlasEntry {
+    pub(crate) tile: AtlasTile,
+    used: u64,
+}
+
+/// cipher patch: how an atlas lets go of the glyphs and SVGs no frame draws any more. Upstream
+/// keeps a glyph's raster at each size for the window's life, so every type size a zoom passes
+/// through stays in the atlas.
+///
+/// A tile is in use while a frame paints its key ([`PlatformAtlas::get_or_insert_with`] stamps
+/// it), and while the frame just drawn holds it: a cached view's primitives are copied from that
+/// frame and never painted again, so a sweep stamps every tile that frame's sprites hold. A
+/// sweep lets go of a glyph's or an SVG's tile only when neither has happened since the sweep
+/// before it. So:
+/// - no frame draws a tile once it is let go: the frame just drawn holds none of its sprites, a
+///   later frame copies primitives only from that frame, and a paint of its key misses and
+///   rasterizes it again;
+/// - it was last drawn before the previous sweep, at least [`AtlasSweep::EVERY`] ago, so no frame
+///   the GPU still reads holds it when its place goes to another tile.
+///
+/// Images are left to their own `remove`.
+#[cfg_attr(
+    not(any(target_os = "macos", test, feature = "test-support")),
+    allow(dead_code)
+)]
+pub(crate) struct AtlasSweep {
+    swept: u64,
+    every: Duration,
+    last: Option<Instant>,
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", test, feature = "test-support")),
+    allow(dead_code)
+)]
+impl AtlasSweep {
+    /// How often a window's atlas sweeps, while the window draws.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) const EVERY: Duration = Duration::from_secs(30);
+
+    pub(crate) fn new(every: Duration) -> Self {
+        Self {
+            swept: 0,
+            every,
+            last: None,
+        }
+    }
+
+    /// The entry for a tile painted now.
+    pub(crate) fn entry(&self, tile: AtlasTile) -> AtlasEntry {
+        AtlasEntry {
+            tile,
+            used: self.swept,
+        }
+    }
+
+    /// `entry`'s tile painted now.
+    pub(crate) fn touch(&self, entry: &mut AtlasEntry) {
+        entry.used = self.swept;
+    }
+
+    /// A sweep of `tiles` when one is due at `now`, `scene` being the frame just drawn: the tiles
+    /// let go, taken out of `tiles`. The first call only starts the clock.
+    pub(crate) fn sweep(
+        &mut self,
+        now: Instant,
+        tiles: &mut collections::FxHashMap<AtlasKey, AtlasEntry>,
+        scene: &Scene,
+    ) -> Vec<AtlasTile> {
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            return Vec::new();
+        };
+        if now.saturating_duration_since(last) < self.every {
+            return Vec::new();
+        }
+        self.last = Some(now);
+        self.swept += 1;
+        let swept = self.swept;
+        let drawn: collections::FxHashSet<(AtlasTextureId, u32)> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| &sprite.tile)
+            .chain(scene.polychrome_sprites.iter().map(|sprite| &sprite.tile))
+            .map(|tile| (tile.texture_id, tile.tile_id.0))
+            .collect();
+        let mut freed = Vec::new();
+        tiles.retain(|key, entry| {
+            if drawn.contains(&(entry.tile.texture_id, entry.tile.tile_id.0)) {
+                entry.used = swept;
+            }
+            let keep = matches!(key, AtlasKey::Image(_)) || entry.used + 2 > swept;
+            if !keep {
+                freed.push(entry.tile.clone());
+            }
+            keep
+        });
+        // What it rests on: every glyph and SVG the frame just drawn holds is still kept. A
+        // primitive copied from an older frame would show here as a tile let go.
+        #[cfg(debug_assertions)]
+        {
+            let kept: collections::FxHashSet<(AtlasTextureId, u32)> = tiles
+                .values()
+                .map(|entry| (entry.tile.texture_id, entry.tile.tile_id.0))
+                .collect();
+            for sprite in &scene.monochrome_sprites {
+                let tile = (sprite.tile.texture_id, sprite.tile.tile_id.0);
+                debug_assert!(kept.contains(&tile), "a drawn tile was let go: {tile:?}");
+            }
+        }
+        freed
+    }
 }
 
 struct AtlasTextureList<T> {
@@ -1964,5 +2088,110 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+// cipher patch: the sweep's rule ([`AtlasSweep`]).
+#[cfg(test)]
+mod atlas_sweep_tests {
+    use super::*;
+    use crate::{FontId, GlyphId, ImageId, MonochromeSprite, TransformationMatrix};
+
+    fn glyph(id: u32) -> AtlasKey {
+        AtlasKey::Glyph(RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id: GlyphId(id),
+            font_size: px(13.),
+            subpixel_variant: Point::default(),
+            scale_factor: 2.,
+            is_emoji: false,
+        })
+    }
+
+    fn tile(id: u32) -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 0,
+                kind: AtlasTextureKind::Monochrome,
+            },
+            tile_id: TileId(id),
+            padding: 0,
+            bounds: Bounds::default(),
+        }
+    }
+
+    /// A frame whose sprites hold the tiles `ids`.
+    fn frame(ids: &[u32]) -> Scene {
+        let mut scene = Scene::default();
+        for &id in ids {
+            scene.monochrome_sprites.push(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: Bounds::default(),
+                content_mask: Default::default(),
+                color: Default::default(),
+                tile: tile(id),
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        scene
+    }
+
+    #[test]
+    fn a_sweep_lets_go_only_of_what_no_frame_drew_since_the_sweep_before() {
+        let start = Instant::now();
+        let at = |sweeps: u32| start + AtlasSweep::EVERY * sweeps;
+        let mut sweep = AtlasSweep::new(AtlasSweep::EVERY);
+        let mut tiles = collections::FxHashMap::default();
+        for id in 1..=4 {
+            tiles.insert(glyph(id), sweep.entry(tile(id)));
+        }
+        let image = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(9),
+            frame_index: 0,
+        });
+        tiles.insert(image.clone(), sweep.entry(tile(9)));
+        let ids = |tiles: &collections::FxHashMap<AtlasKey, AtlasEntry>| {
+            let mut ids: Vec<u32> = tiles.values().map(|entry| entry.tile.tile_id.0).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let paint = |sweep: &AtlasSweep, tiles: &mut collections::FxHashMap<_, _>, id| {
+            sweep.touch(tiles.get_mut(&glyph(id)).unwrap());
+        };
+
+        assert!(
+            sweep.sweep(at(0), &mut tiles, &frame(&[])).is_empty(),
+            "the clock starts"
+        );
+        // Glyph 1 is painted in every interval; glyph 2 is held by every frame just drawn, as a
+        // cached view's is; glyph 4 only by the frame at the first sweep; glyph 3 by none.
+        paint(&sweep, &mut tiles, 1);
+        let early = at(1) - Duration::from_secs(1);
+        assert!(
+            sweep.sweep(early, &mut tiles, &frame(&[])).is_empty(),
+            "not due yet"
+        );
+        assert!(sweep.sweep(at(1), &mut tiles, &frame(&[2, 4])).is_empty());
+        paint(&sweep, &mut tiles, 1);
+        let freed = sweep.sweep(at(2), &mut tiles, &frame(&[2]));
+        assert_eq!(
+            freed,
+            [tile(3)],
+            "neither painted nor drawn since the first sweep"
+        );
+        paint(&sweep, &mut tiles, 1);
+        let freed = sweep.sweep(at(3), &mut tiles, &frame(&[2]));
+        assert_eq!(
+            freed,
+            [tile(4)],
+            "last drawn by the frame at the first sweep"
+        );
+        assert_eq!(
+            ids(&tiles),
+            [1, 2, 9],
+            "painted, drawn, and the image left to remove"
+        );
+        assert!(tiles.contains_key(&image));
     }
 }

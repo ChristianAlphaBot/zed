@@ -1,8 +1,8 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DispatchEventResult, GpuSpecs,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, RequestFrameOptions, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    AnyWindowHandle, AtlasEntry, AtlasKey, AtlasSweep, AtlasTextureId, Bounds, DispatchEventResult,
+    GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, RequestFrameOptions, Size, TestPlatform, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -298,7 +298,10 @@ impl PlatformWindow for TestWindow {
 
 pub(crate) struct TestAtlasState {
     next_id: u32,
-    tiles: HashMap<AtlasKey, AtlasTile>,
+    tiles: HashMap<AtlasKey, AtlasEntry>,
+    /// cipher patch: the Metal atlas's sweep, at every frame, so each test's frames check that no
+    /// drawn tile is let go.
+    sweep: AtlasSweep,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
@@ -308,6 +311,7 @@ impl TestAtlas {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
+            sweep: AtlasSweep::new(std::time::Duration::ZERO),
         }))
     }
 }
@@ -320,11 +324,13 @@ impl PlatformAtlas for TestAtlas {
             Option<(Size<crate::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<crate::AtlasTile>> {
-        let mut state = self.0.lock();
-        if let Some(tile) = state.tiles.get(key) {
-            return Ok(Some(tile.clone()));
+        let mut lock = self.0.lock();
+        let state = &mut *lock;
+        if let Some(entry) = state.tiles.get_mut(key) {
+            state.sweep.touch(entry);
+            return Ok(Some(entry.tile.clone()));
         }
-        drop(state);
+        drop(lock);
 
         let Some((size, _)) = build()? else {
             return Ok(None);
@@ -336,27 +342,40 @@ impl PlatformAtlas for TestAtlas {
         state.next_id += 1;
         let tile_id = state.next_id;
 
-        state.tiles.insert(
-            key.clone(),
-            crate::AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture_id,
-                    kind: crate::AtlasTextureKind::Monochrome,
-                },
-                tile_id: TileId(tile_id),
-                padding: 0,
-                bounds: crate::Bounds {
-                    origin: Point::default(),
-                    size,
-                },
+        let entry = state.sweep.entry(crate::AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind: crate::AtlasTextureKind::Monochrome,
             },
-        );
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: crate::Bounds {
+                origin: Point::default(),
+                size,
+            },
+        });
+        state.tiles.insert(key.clone(), entry);
 
-        Ok(Some(state.tiles[key].clone()))
+        Ok(Some(state.tiles[key].tile.clone()))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
         state.tiles.remove(key);
+    }
+
+    fn usage(&self) -> crate::AtlasUsage {
+        crate::AtlasUsage {
+            tiles: self.0.lock().tiles.len(),
+            ..Default::default()
+        }
+    }
+
+    fn sweep(&self, scene: &crate::Scene) {
+        let mut lock = self.0.lock();
+        let state = &mut *lock;
+        state
+            .sweep
+            .sweep(std::time::Instant::now(), &mut state.tiles, scene);
     }
 }
