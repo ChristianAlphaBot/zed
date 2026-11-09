@@ -49,11 +49,12 @@
 //!
 //!  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
 
+use crate::window::{list_room, shared_room, table_room};
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
     Keystroke, ModifiersChangedEvent, Window,
 };
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
@@ -148,6 +149,39 @@ impl DispatchTree {
             keymap,
             action_registry,
         }
+    }
+
+    /// cipher patch: the bytes this tree's nodes, stacks and tables hold at their capacity,
+    /// without the nodes' listeners ([`Self::listener_bytes`]). Sizes only, for a memory read.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        list_room(&self.node_stack)
+            + list_room(&self.context_stack)
+            + list_room(&self.view_stack)
+            + list_room(&self.nodes)
+            + table_room(&self.focusable_node_ids)
+            + table_room(&self.view_node_ids)
+    }
+
+    /// cipher patch: the bytes the nodes' key, action and modifier listeners hold: their lists at
+    /// capacity, and each closure once (`seen` holds the closures already counted, in this tree
+    /// or another). Sizes only, for a memory read.
+    pub(crate) fn listener_bytes(&self, seen: &mut FxHashSet<usize>) -> usize {
+        let mut bytes = 0;
+        for node in &self.nodes {
+            bytes += list_room(&node.key_listeners)
+                + list_room(&node.action_listeners)
+                + list_room(&node.modifiers_changed_listeners);
+            for listener in &node.key_listeners {
+                bytes += shared_room(listener, seen);
+            }
+            for listener in &node.action_listeners {
+                bytes += shared_room(&listener.listener, seen);
+            }
+            for listener in &node.modifiers_changed_listeners {
+                bytes += shared_room(listener, seen);
+            }
+        }
+        bytes
     }
 
     pub fn clear(&mut self) {

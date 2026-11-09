@@ -229,6 +229,41 @@ pub struct FrameUsage {
     pub scenes: usize,
     /// The line layouts the window keeps for its previous and current frames.
     pub layouts: usize,
+    /// The element states the two frames keep: their tables, each key's id list and each state's
+    /// own box (not what a state points to), and the list of the states a frame read.
+    pub element_states: usize,
+    /// The mouse listeners and the dispatch trees' key, action and modifier listeners: their lists,
+    /// and each closure's captures once however many frames share it (not what a capture points
+    /// to).
+    pub listeners: usize,
+    /// The two dispatch trees' nodes, stacks and tables, without their listeners.
+    pub dispatch: usize,
+    /// The two frames' hitboxes, the window controls' included.
+    pub hitboxes: usize,
+    /// The two frames' other lists: deferred draws, input handlers, tooltip and cursor requests,
+    /// and the tab-stop history.
+    pub lists: usize,
+}
+
+/// cipher patch: the bytes a list holds at its capacity. Sizes only, for a memory read.
+pub(crate) fn list_room<T>(list: &Vec<T>) -> usize {
+    list.capacity() * mem::size_of::<T>()
+}
+
+/// cipher patch: about the bytes a table holds at its capacity, one entry and one control byte
+/// for each entry it has room for. Sizes only, for a memory read.
+pub(crate) fn table_room<K, V, S>(table: &std::collections::HashMap<K, V, S>) -> usize {
+    table.capacity() * (mem::size_of::<(K, V)>() + 1)
+}
+
+/// cipher patch: the bytes a shared closure's allocation holds, its two counts and its captures,
+/// once: `seen` holds the allocations already counted, so a closure two frames share counts once.
+pub(crate) fn shared_room<T: ?Sized>(shared: &Rc<T>, seen: &mut FxHashSet<usize>) -> usize {
+    if seen.insert(Rc::as_ptr(shared).cast::<()>() as usize) {
+        2 * mem::size_of::<usize>() + mem::size_of_val(&**shared)
+    } else {
+        0
+    }
 }
 
 /// cipher patch: the bytes the calling thread's element arena has reserved, which every window
@@ -761,6 +796,38 @@ impl Frame {
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
         }
+    }
+
+    /// cipher patch: adds what this frame's stores other than its scene hold, each at the
+    /// capacity it keeps from the largest frame drawn, to `usage` ([`FrameUsage`]). `seen` keeps a
+    /// closure the two frames share from counting twice. Sizes only, for a memory read.
+    fn add_store_bytes(&self, usage: &mut FrameUsage, seen: &mut FxHashSet<usize>) {
+        usage.element_states += table_room(&self.element_states)
+            + self
+                .element_states
+                .iter()
+                .map(|((id, _), state)| {
+                    2 * mem::size_of::<usize>()
+                        + mem::size_of_val(&*id.0)
+                        + mem::size_of_val(&*state.inner)
+                })
+                .sum::<usize>()
+            + list_room(&self.accessed_element_states);
+        usage.listeners += list_room(&self.mouse_listeners)
+            + self
+                .mouse_listeners
+                .iter()
+                .flatten()
+                .map(|listener| mem::size_of_val(&**listener))
+                .sum::<usize>()
+            + self.dispatch_tree.listener_bytes(seen);
+        usage.dispatch += self.dispatch_tree.heap_bytes();
+        usage.hitboxes += list_room(&self.hitboxes) + list_room(&self.window_control_hitboxes);
+        usage.lists += list_room(&self.deferred_draws)
+            + list_room(&self.input_handlers)
+            + list_room(&self.tooltip_requests)
+            + list_room(&self.cursor_styles)
+            + list_room(&self.tab_stops.insertion_history);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1812,13 +1879,19 @@ impl Window {
     }
 
     /// cipher patch: what this window's frame stores hold, in bytes ([`FrameUsage`]): both frames'
-    /// scenes and the window's line layouts, each at the capacity it keeps from the largest frame
-    /// drawn. Sizes only, for a memory read.
+    /// scenes, element states, listeners, dispatch trees, hitboxes and other lists, and the
+    /// window's line layouts, each at the capacity it keeps from the largest frame drawn. Sizes
+    /// only, for a memory read.
     pub fn frame_usage(&self) -> FrameUsage {
-        FrameUsage {
+        let mut usage = FrameUsage {
             scenes: self.rendered_frame.scene.heap_bytes() + self.next_frame.scene.heap_bytes(),
             layouts: self.text_system.layout_heap_bytes(),
-        }
+            ..FrameUsage::default()
+        };
+        let mut seen = FxHashSet::default();
+        self.rendered_frame.add_store_bytes(&mut usage, &mut seen);
+        self.next_frame.add_store_bytes(&mut usage, &mut seen);
+        usage
     }
 
     /// Returns the size of the drawable area within the window.
