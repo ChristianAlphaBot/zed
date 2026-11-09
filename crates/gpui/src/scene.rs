@@ -20,6 +20,26 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
+/// cipher patch: a cleared list that holds more than [`ROOM_FLOOR`] bytes and more than this many
+/// times what its frame used shrinks to twice that use. Without it each scene kept the room of
+/// the largest frame ever drawn into it after the window went back to small frames (two scenes
+/// per window, swapped every draw); a list whose frames stay near one size never shrinks.
+pub(crate) const ROOM_OVER: usize = 4;
+
+/// cipher patch: a list holding no more than this many bytes keeps its room when cleared.
+pub(crate) const ROOM_FLOOR: usize = 1 << 20;
+
+/// cipher patch: clears `list` and, past [`ROOM_FLOOR`] and [`ROOM_OVER`], gives back the room
+/// the frame it held did not use.
+pub(crate) fn clear_keeping_room<T>(list: &mut Vec<T>) {
+    let used = list.len();
+    list.clear();
+    let room = list.capacity();
+    if room * std::mem::size_of::<T>() > ROOM_FLOOR && room > ROOM_OVER * used {
+        list.shrink_to(2 * used);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -36,8 +56,9 @@ pub(crate) struct Scene {
 
 impl Scene {
     /// cipher patch: the bytes this scene's lists hold at their capacity, which each keeps from the
-    /// largest frame drawn into it, and the vertices of the paths it holds now (each path is held
-    /// twice: in `paths` and as its paint operation). Sizes only, for a memory read.
+    /// frames drawn into it ([`clear_keeping_room`]), and the vertices of the paths it holds now
+    /// (each path is held twice: in `paths` and as its paint operation). Sizes only, for a memory
+    /// read.
     pub(crate) fn heap_bytes(&self) -> usize {
         fn room<T>(list: &Vec<T>) -> usize {
             list.capacity() * std::mem::size_of::<T>()
@@ -68,17 +89,18 @@ impl Scene {
             + room(&self.surfaces)
     }
 
+    /// cipher patch: each list clears through [`clear_keeping_room`].
     pub fn clear(&mut self) {
-        self.paint_operations.clear();
+        clear_keeping_room(&mut self.paint_operations);
         self.primitive_bounds.clear();
-        self.layer_stack.clear();
-        self.paths.clear();
-        self.shadows.clear();
-        self.quads.clear();
-        self.underlines.clear();
-        self.monochrome_sprites.clear();
-        self.polychrome_sprites.clear();
-        self.surfaces.clear();
+        clear_keeping_room(&mut self.layer_stack);
+        clear_keeping_room(&mut self.paths);
+        clear_keeping_room(&mut self.shadows);
+        clear_keeping_room(&mut self.quads);
+        clear_keeping_room(&mut self.underlines);
+        clear_keeping_room(&mut self.monochrome_sprites);
+        clear_keeping_room(&mut self.polychrome_sprites);
+        clear_keeping_room(&mut self.surfaces);
     }
 
     pub fn len(&self) -> usize {

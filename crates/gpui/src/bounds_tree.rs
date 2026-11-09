@@ -111,8 +111,10 @@ where
     }
 
     /// Clears all nodes from the tree.
+    ///
+    /// cipher patch: the nodes clear through [`crate::scene::clear_keeping_room`].
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        crate::scene::clear_keeping_room(&mut self.nodes);
         self.root = None;
         self.max_leaf = None;
         self.insert_path.clear();
