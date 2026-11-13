@@ -1,3 +1,4 @@
+use crate::scene::{ROOM_FLOOR, ROOM_OVER};
 use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
     point, size,
@@ -32,26 +33,70 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// cipher patch: the nodes the last frame laid out, counted when [`Self::clear`] let them go.
+    nodes_drawn: usize,
+    /// cipher patch: the most nodes a frame laid out since the tree was made: the room the tree's
+    /// node stores keep, as they never shrink.
+    nodes_peak: usize,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
 
+/// cipher patch: about the bytes one node holds in the tree: its style, its layout cache and its
+/// two layouts. Taffy's node type is private, so its parts are summed; the tree's other stores and
+/// a leaf's measuring closure are beside it. Only for [`ROOM_FLOOR`].
+const NODE_BYTES: usize = std::mem::size_of::<taffy::Style>()
+    + std::mem::size_of::<taffy::tree::Cache>()
+    + 2 * std::mem::size_of::<taffy::tree::Layout>();
+
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
-        let mut taffy = TaffyTree::new();
+        Self::with_room(16)
+    }
+
+    /// cipher patch: an engine whose tree has room for `nodes` nodes before it grows (taffy's own
+    /// default is 16).
+    fn with_room(nodes: usize) -> Self {
+        let mut taffy = TaffyTree::with_capacity(nodes);
         taffy.enable_rounding();
         TaffyLayoutEngine {
             taffy,
             absolute_layout_bounds: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            nodes_drawn: 0,
+            nodes_peak: 0,
         }
     }
 
+    /// Lets go of the frame just laid out. Called once a draw, after the frame's layout and paint
+    /// (`Window::draw`), so no layout id outlives the tree it came from.
+    ///
+    /// cipher patch: taffy's own clear empties the tree's node stores but keeps their room, and
+    /// keeps every measuring closure the frame's leaves were given, with what each captures, until
+    /// a later frame's measured leaf takes its slot. As a scene's lists do
+    /// ([`crate::scene::clear_keeping_room`]): once the tree has room for more than [`ROOM_FLOOR`]
+    /// bytes of nodes and more than [`ROOM_OVER`] times the nodes this frame laid out, the engine
+    /// is made anew with room for twice them, which lets all of that go.
     pub fn clear(&mut self) {
-        self.taffy.clear();
-        self.absolute_layout_bounds.clear();
-        self.computed_layouts.clear();
+        let used = self.taffy.total_node_count();
+        let peak = self.nodes_peak.max(used);
+        if peak * NODE_BYTES > ROOM_FLOOR && peak > ROOM_OVER * used {
+            *self = Self::with_room(2 * used);
+            self.nodes_peak = used;
+        } else {
+            self.taffy.clear();
+            self.absolute_layout_bounds.clear();
+            self.computed_layouts.clear();
+            self.nodes_peak = peak;
+        }
+        self.nodes_drawn = used;
+    }
+
+    /// cipher patch: the nodes the last frame laid out, and the most a frame laid out since the
+    /// tree was last made ([`Self::clear`]). Counts only, for a memory read.
+    pub(crate) fn nodes(&self) -> (usize, usize) {
+        (self.nodes_drawn, self.nodes_peak)
     }
 
     pub fn request_layout(

@@ -221,7 +221,8 @@ thread_local! {
 }
 
 /// cipher patch: what a window's frame stores hold, in bytes, each at the capacity it keeps from
-/// the largest frame drawn ([`Window::frame_usage`]). Sizes only: nothing of what a frame shows.
+/// the largest frame drawn ([`Window::frame_usage`]), and the nodes its layout tree holds. Sizes
+/// and counts only: nothing of what a frame shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameUsage {
     /// The two frames' scenes: their primitive lists, paint operations and bounds trees, and the
@@ -243,6 +244,13 @@ pub struct FrameUsage {
     /// The two frames' other lists: deferred draws, input handlers, tooltip and cursor requests,
     /// and the tab-stop history.
     pub lists: usize,
+    /// The nodes the window's layout tree laid out for the last frame drawn. A count, not bytes;
+    /// 0 while a layout is being computed.
+    pub layout_nodes: usize,
+    /// The most nodes a frame laid out since the window's layout tree was last made: the room the
+    /// tree keeps until frames are small again, when the tree is made anew. A count, not
+    /// bytes; 0 while a layout is being computed.
+    pub layout_nodes_peak: usize,
 }
 
 /// cipher patch: the bytes a list holds at its capacity. Sizes only, for a memory read.
@@ -1880,12 +1888,18 @@ impl Window {
 
     /// cipher patch: what this window's frame stores hold, in bytes ([`FrameUsage`]): both frames'
     /// scenes, element states, listeners, dispatch trees, hitboxes and other lists, and the
-    /// window's line layouts, each at the capacity it keeps from the largest frame drawn. Sizes
-    /// only, for a memory read.
+    /// window's line layouts, each at the capacity it keeps from the largest frame drawn, and the
+    /// nodes its layout tree laid out. Sizes and counts only, for a memory read.
     pub fn frame_usage(&self) -> FrameUsage {
+        let (layout_nodes, layout_nodes_peak) = self
+            .layout_engine
+            .as_ref()
+            .map_or((0, 0), TaffyLayoutEngine::nodes);
         let mut usage = FrameUsage {
             scenes: self.rendered_frame.scene.heap_bytes() + self.next_frame.scene.heap_bytes(),
             layouts: self.text_system.layout_heap_bytes(),
+            layout_nodes,
+            layout_nodes_peak,
             ..FrameUsage::default()
         };
         let mut seen = FxHashSet::default();
